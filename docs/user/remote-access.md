@@ -236,6 +236,55 @@ again on its next connect.
 For Antigravity's Google callback on a remote host, see
 [remote sign-in](./providers-antigravity.md#sign-in-from-a-remote-device).
 
+## Declare desktop environments from a file
+
+On UNIX desktops, set `T3CODE_DECLARED_ENVIRONMENTS` to the absolute path of a
+public JSON declaration before starting the desktop app. This adds remote routes
+without a pairing dialog. Windows rejects this option because UNIX file checks
+do not validate Windows access-control lists. Other connection methods are unchanged.
+
+An authorized operator must first issue a bearer session on each remote host
+and deliver its token as a private runtime file. Declarations do not issue
+sessions, grant permissions, or make an endpoint reachable. See
+[access management](#manage-or-revoke-access) for session permissions.
+
+For example, a declaration can contain:
+
+```json
+{
+  "schemaVersion": 1,
+  "environments": [
+    {
+      "environmentId": "replace-with-the-remote-environment-id",
+      "label": "Build server",
+      "url": "https://build.example.com",
+      "bearerTokenFile": "/private/runtime/t3-build-token"
+    }
+  ]
+}
+```
+
+Use the remote host's existing environment ID, not its hostname. Keep tokens out
+of JSON, command arguments, and logs. Each token file must be a regular file,
+owned by the desktop user or root, with no group or other permissions. Modes
+`0400` and `0600` are suitable. Runtime symlinks, including secret-manager links,
+are accepted. Token paths that resolve into `/nix/store` are rejected.
+
+Declarations are limited to 1 MiB and token files to 64 KiB. URLs must be HTTPS
+origins, or HTTP loopback origins such as `http://127.0.0.1:3773`. Paths, URL
+credentials, queries, fragments, duplicate environment IDs, and inline token
+fields are rejected. A validation, encryption, or write failure rejects the
+whole reconciliation without replacing the saved encrypted catalog.
+
+Each declaration maintains one `nix:<environment-id>` route in the existing
+encrypted connection catalog. Other routes, credentials, and disabled selections
+are preserved. After running agent work has finished, quit and reopen the desktop
+to apply changes or rotate tokens. The normal system keyring must be available.
+
+Removing a declaration does **not** remove its saved route or revoke its session.
+Remove the route in connection settings and revoke the session on the remote host
+to end access. Removing only the saved route is temporary while it remains declared.
+
 ## Browser on a remote environment
 
 Browser tabs belong to the environment, so you and your agents see the same
