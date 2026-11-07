@@ -12,6 +12,7 @@ import {
 } from "@t3tools/client-runtime/platform";
 import type { PersistedSavedEnvironmentRecord } from "@t3tools/contracts";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
@@ -25,6 +26,7 @@ import * as Schema from "effect/Schema";
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
 import * as DesktopSavedEnvironments from "../settings/DesktopSavedEnvironments.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopDeclaredEnvironments from "./DesktopDeclaredEnvironments.ts";
 
 const EncryptedConnectionCatalogDocument = Schema.Struct({
   version: Schema.Literal(1),
@@ -156,6 +158,7 @@ export class DesktopConnectionCatalogStore extends Context.Service<
       | DesktopConnectionCatalogStoreDecodeError
       | DesktopConnectionCatalogStoreMigrationError
       | DesktopConnectionCatalogStoreProtectionError
+      | DesktopDeclaredEnvironments.DesktopDeclaredEnvironmentsError
     >;
     readonly set: (
       catalog: string,
@@ -384,6 +387,10 @@ export const make = Effect.gen(function* () {
   const random = yield* SecureRandom.SecureRandom;
   const savedEnvironments = yield* DesktopSavedEnvironments.DesktopSavedEnvironments;
   const catalogPath = path.join(environment.stateDir, "connection-catalog.json");
+  const declarationPath = yield* Config.String("T3CODE_DECLARED_ENVIRONMENTS").pipe(
+    Config.option,
+    Config.map(Option.filter((value) => value.length > 0)),
+  );
   const encryptionAvailable = safeStorage.isEncryptionAvailable.pipe(
     Effect.mapError(
       (cause) =>
@@ -420,8 +427,19 @@ export const make = Effect.gen(function* () {
     });
   });
 
+  // Every getter-side availability check must fail closed while declarations are configured.
+  const readableEncryptionAvailable = encryptionAvailable.pipe(
+    Effect.filterOrFail(
+      (available) => available || Option.isNone(declarationPath),
+      () =>
+        new DesktopDeclaredEnvironments.DesktopDeclaredEnvironmentsError({
+          operation: "encryption-unavailable",
+        }),
+    ),
+  );
+
   const migrateLegacyCatalog = Effect.gen(function* () {
-    if (!(yield* encryptionAvailable)) {
+    if (!(yield* readableEncryptionAvailable)) {
       return Option.none<string>();
     }
     const records = yield* savedEnvironments.getRegistry.pipe(
@@ -448,44 +466,84 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
-    yield* writeCatalog(encoded).pipe(
-      Effect.mapError(
-        (cause) =>
-          new DesktopConnectionCatalogStoreMigrationError({
-            operation: "persist-catalog",
-            catalogPath,
-            cause,
-          }),
-      ),
-    );
+    // Persistence follows reconciliation so a bad declaration cannot partially commit migration.
     return Option.some(encoded);
   });
 
-  return DesktopConnectionCatalogStore.of({
-    get: Effect.gen(function* () {
-      const document = yield* readDocument(fileSystem, catalogPath);
-      if (Option.isNone(document)) {
-        return yield* migrateLegacyCatalog;
+  /** Validate all additions before using the native encrypted atomic writer. */
+  const reconcileCatalog = Effect.fn("desktop.connectionCatalogStore.reconcileCatalog")(function* (
+    catalog: Option.Option<string>,
+  ) {
+    if (Option.isNone(declarationPath)) return catalog;
+    const next = yield* DesktopDeclaredEnvironments.mergeCatalog(
+      Option.getOrNull(catalog),
+      declarationPath.value,
+      environment.platform,
+    );
+    if (next === Option.getOrNull(catalog)) return catalog;
+    yield* writeCatalog(next).pipe(
+      Effect.mapError(
+        () =>
+          new DesktopDeclaredEnvironments.DesktopDeclaredEnvironmentsError({
+            operation: "catalog-access",
+          }),
+      ),
+    );
+    return Option.some(next);
+  });
+
+  const get = Effect.gen(function* () {
+    if (Option.isSome(declarationPath)) yield* readableEncryptionAvailable;
+    const document = yield* readDocument(fileSystem, catalogPath);
+    if (Option.isNone(document)) {
+      const migrated = yield* migrateLegacyCatalog;
+      const reconciled = yield* reconcileCatalog(migrated);
+      if (Option.isSome(migrated) && reconciled === migrated) {
+        yield* writeCatalog(migrated.value).pipe(
+          Effect.mapError(
+            (cause) =>
+              new DesktopConnectionCatalogStoreMigrationError({
+                operation: "persist-catalog",
+                catalogPath,
+                cause,
+              }),
+          ),
+        );
       }
-      if (!(yield* encryptionAvailable)) {
-        return Option.none<string>();
-      }
-      const decrypted = yield* decodeSecretBytes(catalogPath, document.value.encryptedCatalog).pipe(
-        Effect.flatMap((encryptedCatalog) =>
-          safeStorage.decryptString(encryptedCatalog).pipe(
-            Effect.mapError(
-              (cause) =>
-                new DesktopConnectionCatalogStoreProtectionError({
-                  operation: "decrypt-catalog",
-                  catalogPath,
-                  cause,
-                }),
-            ),
+      return reconciled;
+    }
+    if (!(yield* readableEncryptionAvailable)) {
+      return Option.none<string>();
+    }
+    const decrypted = yield* decodeSecretBytes(catalogPath, document.value.encryptedCatalog).pipe(
+      Effect.flatMap((encryptedCatalog) =>
+        safeStorage.decryptString(encryptedCatalog).pipe(
+          Effect.mapError(
+            (cause) =>
+              new DesktopConnectionCatalogStoreProtectionError({
+                operation: "decrypt-catalog",
+                catalogPath,
+                cause,
+              }),
           ),
         ),
-      );
-      return Option.some(decrypted);
-    }).pipe(Effect.withSpan("desktop.connectionCatalogStore.get")),
+      ),
+    );
+    return yield* reconcileCatalog(Option.some(decrypted));
+  }).pipe(Effect.withSpan("desktop.connectionCatalogStore.get"));
+
+  return DesktopConnectionCatalogStore.of({
+    get: Option.isNone(declarationPath)
+      ? get
+      : get.pipe(
+          Effect.mapError((error) =>
+            error._tag === "DesktopDeclaredEnvironmentsError"
+              ? error
+              : new DesktopDeclaredEnvironments.DesktopDeclaredEnvironmentsError({
+                  operation: "catalog-access",
+                }),
+          ),
+        ),
     set: Effect.fn("desktop.connectionCatalogStore.set")(function* (catalog) {
       if (!(yield* encryptionAvailable)) {
         return false;
